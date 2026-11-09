@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# ocsearch — schema-aware, read-only wrapper around search_session.py.
+#
+# Bare input is always a search phrase; commands live behind long flags so a
+# keyword can never be mistaken for a subcommand.
+#
+#   ocsearch [--max-chars N] <keyword...>       search (default)
+#   ocsearch ses_<id> [OUT]                     transcript by session id
+#   ocsearch --list                             recent sessions
+#   ocsearch --titles <pattern>                 title search
+#   ocsearch --search <keyword...>              explicit search
+#   ocsearch --info|--tools|--patches <id>      session details
+#   ocsearch --transcript <id> [OUT]            full Markdown transcript
+#   ocsearch --schemas                          which schemas exist
+#   ocsearch --help                              this help
+#
+# Options:
+#   --max-chars N, -c N   output length budget in characters (default 12000, 0 = unlimited)
+#   --per-session N       snippets shown per session in grouped search (default 3)
+#   --snippet N, -s N     snippet width in characters (default 180 grouped / 300 flat, 0 = full)
+#   --no-group            flat result list instead of one block per session
+#   --color MODE          auto (default) | always | never
+#   --out FILE, -o FILE   transcript output path
+#   --include-current     include the current opencode session in results
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY=search_session.py
+DEFAULT_MAX_CHARS=12000
+
+run() { exec python3 "$SCRIPT_DIR/$PY" "$@"; }
+
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+die() { printf 'ocsearch: %s\n' "$*" >&2; exit 2; }
+
+[ $# -eq 0 ] && { run list; }
+
+mode=""
+max_chars=""
+per_session=""
+snippet=""
+color=""
+group=1
+out=""
+include_current=0
+args=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)             mode=help; shift ;;
+    --schemas)             mode=schemas; shift ;;
+    --list)                mode=list; shift ;;
+    --titles|--title)      mode=title; shift ;;
+    --search)              mode=search; shift ;;
+    --info)                mode=info; shift ;;
+    --tools)               mode=tools; shift ;;
+    --patches)             mode=patches; shift ;;
+    --transcript)          mode=transcript; shift ;;
+    --max-chars|-c)        [ $# -ge 2 ] || die "--max-chars needs a value"; max_chars="$2"; shift 2 ;;
+    --max-chars=*)         max_chars="${1#*=}"; shift ;;
+    --per-session)         [ $# -ge 2 ] || die "--per-session needs a value"; per_session="$2"; shift 2 ;;
+    --per-session=*)       per_session="${1#*=}"; shift ;;
+    --snippet|-s)          [ $# -ge 2 ] || die "--snippet needs a value"; snippet="$2"; shift 2 ;;
+    --snippet=*)           snippet="${1#*=}"; shift ;;
+    --group)               group=1; shift ;;
+    --no-group)            group=0; shift ;;
+    --color)               [ $# -ge 2 ] || die "--color needs a value"; color="$2"; shift 2 ;;
+    --color=*)             color="${1#*=}"; shift ;;
+    --out|-o)              [ $# -ge 2 ] || die "--out needs a value"; out="$2"; shift 2 ;;
+    --include-current)     include_current=1; shift ;;
+    --)                    shift; args+=("$@"); break ;;
+    -?*)                   die "unknown option: $1 (try --help)" ;;
+    *)                     args+=("$1"); shift ;;
+  esac
+done
+
+# Mode inference when no flag selected: ses_* is a transcript, empty lists,
+# anything else is a search phrase.
+if [ -z "$mode" ]; then
+  if [ ${#args[@]} -eq 0 ]; then
+    mode=list
+  elif [[ "${args[0]}" == ses_* ]]; then
+    mode=transcript
+  else
+    mode=search
+  fi
+fi
+
+# Exclude the current session from discovery commands unless asked to include it.
+if [ "$include_current" -eq 0 ] && [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+  export SS_EXCLUDE="$OPENCODE_SESSION_ID"
+else
+  export SS_EXCLUDE=""
+fi
+
+# One length knob for every command: cap output volume, never result count.
+if [ -n "$max_chars" ]; then
+  [[ "$max_chars" =~ ^[0-9]+$ ]] || die "invalid max-chars: $max_chars (non-negative integer expected)"
+  max_chars=$((10#$max_chars))
+fi
+export SS_MAX_CHARS="${max_chars:-$DEFAULT_MAX_CHARS}"
+
+if [ -n "$per_session" ]; then
+  [[ "$per_session" =~ ^[0-9]+$ ]] || die "invalid per-session: $per_session (positive integer expected)"
+  per_session=$((10#$per_session))
+  [ "$per_session" -ge 1 ] || die "invalid per-session: $per_session (must be >= 1)"
+fi
+export SS_GROUP="$group"
+export SS_PER_SESSION="${per_session:-3}"
+
+if [ -n "$snippet" ]; then
+  [[ "$snippet" =~ ^[0-9]+$ ]] || die "invalid snippet: $snippet (non-negative integer expected)"
+  snippet=$((10#$snippet))
+fi
+export SS_SNIPPET="${snippet:-}"
+
+case "$color" in
+  ""|auto|always|never) ;;
+  *) die "invalid color: $color (auto|always|never)" ;;
+esac
+export SS_COLOR="${color:-auto}"
+
+# Friendly nudge for the common mistake: options placed after `--` are literal.
+for a in "${args[@]}"; do
+  case "$a" in
+    --max-chars|--per-session|--snippet|--group|--no-group|--color|--include-current|--out|--list|--titles|--search|--info|--tools|--patches|--transcript|--schemas)
+      printf 'ocsearch: note: "%s" after -- is search text; put options before --\n' "$a" >&2
+      break ;;
+  esac
+done
+
+require_phrase() { # validate in the main shell so die actually exits
+  local flag="--$mode"
+  [ "$mode" = title ] && flag="--titles"
+  [ ${#args[@]} -gt 0 ] || die "$flag needs an argument"
+  [ -n "${args[*]//[[:space:]]/}" ] || die "$flag needs a non-empty argument"
+}
+
+case "$mode" in
+  help)       usage ;;
+  schemas)    run schemas ;;
+  list)       [ ${#args[@]} -eq 0 ] || die "unexpected argument: ${args[0]}"; run list ;;
+  title)      require_phrase; run title "${args[*]}" ;;
+  search)     require_phrase; run search "${args[*]}" ;;
+  info|tools|patches)
+              [ ${#args[@]} -gt 0 ] || die "--$mode needs a SESSION_ID"
+              run "$mode" "${args[0]}" ;;
+  transcript)
+              [ ${#args[@]} -gt 0 ] || die "--transcript needs a SESSION_ID"
+              run transcript "${args[0]}" "${out:-${args[1]:-}}" ;;
+esac
